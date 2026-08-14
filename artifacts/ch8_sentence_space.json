@@ -1,0 +1,87 @@
+{
+  "per_model": [
+    {
+      "seed": 0,
+      "which": "top_h",
+      "mean_d_word_order": 0.0219,
+      "mean_d_voice": 0.0247,
+      "ratio_order_over_voice": 0.888
+    },
+    {
+      "seed": 0,
+      "which": "all_h",
+      "mean_d_word_order": 0.1878,
+      "mean_d_voice": 0.2341,
+      "ratio_order_over_voice": 0.802
+    },
+    {
+      "seed": 1,
+      "which": "top_h",
+      "mean_d_word_order": 0.0083,
+      "mean_d_voice": 0.0089,
+      "ratio_order_over_voice": 0.929
+    },
+    {
+      "seed": 1,
+      "which": "all_h",
+      "mean_d_word_order": 0.1321,
+      "mean_d_voice": 0.1679,
+      "ratio_order_over_voice": 0.787
+    },
+    {
+      "seed": 2,
+      "which": "top_h",
+      "mean_d_word_order": 0.0046,
+      "mean_d_voice": 0.0114,
+      "ratio_order_over_voice": 0.401
+    },
+    {
+      "seed": 2,
+      "which": "all_h",
+      "mean_d_word_order": 0.0953,
+      "mean_d_voice": 0.1448,
+      "ratio_order_over_voice": 0.658
+    }
+  ],
+  "example_detail": {
+    "which_vector": "top_h",
+    "per_probe": [
+      {
+        "base": "a man is holding a dog",
+        "d_word_order": 0.0592,
+        "d_voice": 0.0611
+      },
+      {
+        "base": "a woman is watching a boy",
+        "d_word_order": 0.003,
+        "d_voice": 0.0062
+      },
+      {
+        "base": "a girl is pushing a man",
+        "d_word_order": 0.0025,
+        "d_voice": 0.0047
+      },
+      {
+        "base": "a boy is carrying a girl",
+        "d_word_order": 0.0024,
+        "d_voice": 0.0166
+      },
+      {
+        "base": "a dog is chasing a child",
+        "d_word_order": 0.0633,
+        "d_voice": 0.0561
+      },
+      {
+        "base": "a man is pulling a woman",
+        "d_word_order": 0.0008,
+        "d_voice": 0.0032
+      }
+    ],
+    "mean_d_word_order": 0.0219,
+    "mean_d_voice": 0.0247,
+    "ratio_order_over_voice": 0.888,
+    "bow_control_d_word_order": 0.0,
+    "bow_control_d_voice": 0.0183
+  },
+  "pca_explained_variance": 0.8234423398971558
+}

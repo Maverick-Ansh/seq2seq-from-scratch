@@ -1,0 +1,32 @@
+{
+  "1 GPU": {
+    "sec": 1.1414462019999974,
+    "wps": 6728,
+    "mem_gpu0": 6.02,
+    "mem_gpu1": 0.0
+  },
+  "2 GPU model-par (no pipeline)": {
+    "sec": 0.7270580419999533,
+    "wps": 10563,
+    "mem_gpu0": 3.53,
+    "mem_gpu1": 2.56
+  },
+  "2 GPU model-par (pipeline x2)": {
+    "sec": 0.6479443460000311,
+    "wps": 11852,
+    "mem_gpu0": 3.34,
+    "mem_gpu1": 2.25
+  },
+  "2 GPU model-par (pipeline x4)": {
+    "sec": 0.7735174550000465,
+    "wps": 9928,
+    "mem_gpu0": 3.8,
+    "mem_gpu1": 2.09
+  },
+  "2 GPU model-par (pipeline x8)": {
+    "sec": 0.9839431479999803,
+    "wps": 7805,
+    "mem_gpu0": 4.14,
+    "mem_gpu1": 2.15
+  }
+}

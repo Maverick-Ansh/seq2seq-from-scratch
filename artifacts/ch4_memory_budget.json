@@ -1,0 +1,35 @@
+{
+  "paper_static": {
+    "sgd": {
+      "weights_GB": 1.536576,
+      "gradients_GB": 1.536576,
+      "optimizer_state_GB": 0.0,
+      "subtotal_GB": 3.073152
+    },
+    "momentum": {
+      "weights_GB": 1.536576,
+      "gradients_GB": 1.536576,
+      "optimizer_state_GB": 1.536576,
+      "subtotal_GB": 4.609728
+    },
+    "adam": {
+      "weights_GB": 1.536576,
+      "gradients_GB": 1.536576,
+      "optimizer_state_GB": 3.073152,
+      "subtotal_GB": 6.146304
+    }
+  },
+  "paper_activations": {
+    "lstm_activations_GB": 0.36864,
+    "logits_GB": 2.4576,
+    "total_GB": 2.82624,
+    "logits_share": 0.87
+  },
+  "our_activations": {
+    "lstm_activations_GB": 0.18874368,
+    "logits_GB": 0.19765248,
+    "total_GB": 0.38639616,
+    "logits_share": 0.512
+  },
+  "paper_step_total_GB": 5.899392
+}

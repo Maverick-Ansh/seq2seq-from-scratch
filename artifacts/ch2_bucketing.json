@@ -1,0 +1,66 @@
+{
+  "1": {
+    "real_tokens": 899107,
+    "rectangle_cells": 1885360,
+    "token_efficiency": 0.4769,
+    "sequential_timesteps": 14760,
+    "num_batches": 227,
+    "speedup": 1.0
+  },
+  "2": {
+    "real_tokens": 899107,
+    "rectangle_cells": 1509296,
+    "token_efficiency": 0.5957,
+    "sequential_timesteps": 11822,
+    "num_batches": 227,
+    "speedup": 1.249
+  },
+  "5": {
+    "real_tokens": 899107,
+    "rectangle_cells": 1276336,
+    "token_efficiency": 0.7044,
+    "sequential_timesteps": 10002,
+    "num_batches": 227,
+    "speedup": 1.476
+  },
+  "10": {
+    "real_tokens": 899107,
+    "rectangle_cells": 1194928,
+    "token_efficiency": 0.7524,
+    "sequential_timesteps": 9366,
+    "num_batches": 227,
+    "speedup": 1.576
+  },
+  "20": {
+    "real_tokens": 899107,
+    "rectangle_cells": 1114416,
+    "token_efficiency": 0.8068,
+    "sequential_timesteps": 8737,
+    "num_batches": 227,
+    "speedup": 1.689
+  },
+  "50": {
+    "real_tokens": 899107,
+    "rectangle_cells": 1027680,
+    "token_efficiency": 0.8749,
+    "sequential_timesteps": 8062,
+    "num_batches": 227,
+    "speedup": 1.831
+  },
+  "100": {
+    "real_tokens": 899107,
+    "rectangle_cells": 984288,
+    "token_efficiency": 0.9135,
+    "sequential_timesteps": 7723,
+    "num_batches": 227,
+    "speedup": 1.911
+  },
+  "1000": {
+    "real_tokens": 899107,
+    "rectangle_cells": 938072,
+    "token_efficiency": 0.9585,
+    "sequential_timesteps": 7372,
+    "num_batches": 227,
+    "speedup": 2.002
+  }
+}

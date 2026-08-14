@@ -1,0 +1,28 @@
+{
+  "paper": {
+    "src_embedding": 160000000,
+    "tgt_embedding": 80000000,
+    "encoder_lstm": 32032000,
+    "decoder_lstm": 32032000,
+    "generator_softmax": 80080000,
+    "total": 384144000,
+    "recurrent_only": 64064000
+  },
+  "ours": {
+    "src_embedding": 3019776,
+    "tgt_embedding": 3294208,
+    "encoder_lstm": 8404992,
+    "decoder_lstm": 8404992,
+    "generator_softmax": 3300642,
+    "total": 26424610,
+    "recurrent_only": 16809984
+  },
+  "ours_config": {
+    "src_vocab": 5898,
+    "tgt_vocab": 6434,
+    "emb_dim": 512,
+    "hidden_dim": 512,
+    "num_layers": 4,
+    "dropout": 0.2
+  }
+}

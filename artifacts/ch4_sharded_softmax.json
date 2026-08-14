@@ -1,0 +1,7 @@
+{
+  "loss_diff": 8.881784197001252e-16,
+  "grad_diff": 6.071532165918825e-18,
+  "common_out_bytes": 61440000,
+  "naive_back_bytes": 1228800000,
+  "smart_back_bytes": 122880
+}

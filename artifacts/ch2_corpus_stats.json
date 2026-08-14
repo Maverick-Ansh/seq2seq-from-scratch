@@ -1,0 +1,24 @@
+{
+  "langs": "en->fr",
+  "sentences": {
+    "train": 29000,
+    "valid": 1014,
+    "test": 1000
+  },
+  "train_tokens": {
+    "en": 380728,
+    "fr": 431379
+  },
+  "vocab": {
+    "en": 5898,
+    "fr": 6434
+  },
+  "test_token_coverage": {
+    "en": 0.9833,
+    "fr": 0.9831
+  },
+  "mean_len": {
+    "en": 13.13,
+    "fr": 14.88
+  }
+}
