@@ -157,6 +157,63 @@ class Seq2Seq(nn.Module):
         return F.log_softmax(logits, dim=-1), state
 
 
+class EnsembleSeq2Seq(nn.Module):
+    """Several independently-trained Seq2Seq models decoded as one.
+
+    §3.6 reports the ensemble as the difference between beating the SMT
+    baseline and not: a single reversed LSTM scores 30.59 BLEU (below the
+    33.30 baseline), while an ensemble of 5 scores 34.81.
+
+    HOW ENSEMBLING WORKS HERE. At each decoding step, every member produces a
+    distribution over the vocabulary. We average them and hand the result to
+    the beam. Averaging in LOG space (a geometric mean of probabilities, then
+    renormalised) rather than probability space is the standard choice, and the
+    difference matters: the geometric mean is small whenever ANY member says
+    "unlikely", so a single confident objection can veto a word. An arithmetic
+    mean lets one enthusiastic member carry a word through. For translation the
+    conservative option is the better one.
+
+    WHY IT HELPS. Each model makes different mistakes — different random init,
+    different batch order. Errors that are uncorrelated across members partly
+    cancel when averaged, while the signal, which is shared, does not. The
+    catch is in the word "uncorrelated": ensembling N copies of the same
+    training run with the same seed buys nothing. Diversity is the whole asset.
+
+    IMPLEMENTATION NOTE. We concatenate the members' states along the LAYER
+    axis, so an ensemble's state has the same rank and shape convention as a
+    single model's (L*M, B, H). That lets `beam.beam_search` reorder and
+    repeat_interleave the state with no special-casing — the ensemble is a
+    drop-in for a single model.
+    """
+
+    def __init__(self, models):
+        super().__init__()
+        assert len(models) > 0
+        self.models = nn.ModuleList(models)
+        self.tgt_vocab = models[0].tgt_vocab
+        self.num_layers = models[0].num_layers
+
+    def encode(self, src):
+        hs, cs = zip(*[m.encode(src) for m in self.models])
+        return torch.cat(hs, dim=0), torch.cat(cs, dim=0)
+
+    def decode_step(self, y_prev, state):
+        h, c = state
+        L = self.num_layers
+        logps, new_h, new_c = [], [], []
+        for i, m in enumerate(self.models):
+            sl = slice(i * L, (i + 1) * L)
+            lp, (hi, ci) = m.decode_step(y_prev, (h[sl].contiguous(), c[sl].contiguous()))
+            logps.append(lp)
+            new_h.append(hi)
+            new_c.append(ci)
+        # Mean of log-probs, then renormalise so the result is a proper
+        # distribution again (the mean of log-probs is not normalised).
+        mean_lp = torch.stack(logps).mean(0)
+        mean_lp = mean_lp - mean_lp.logsumexp(dim=-1, keepdim=True)
+        return mean_lp, (torch.cat(new_h, dim=0), torch.cat(new_c, dim=0))
+
+
 # ---------------------------------------------------------------------------
 # Loss
 # ---------------------------------------------------------------------------
