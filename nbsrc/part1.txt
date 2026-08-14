@@ -1,0 +1,522 @@
+#%%md
+# Sequence to Sequence Learning with Neural Networks — built from scratch on 2×T4
+
+[![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/Maverick-Ansh/seq2seq-from-scratch/blob/main/notebooks/seq2seq_from_scratch.ipynb)
+
+**Paper:** Ilya Sutskever, Oriol Vinyals, Quoc V. Le — *Sequence to Sequence Learning with Neural Networks*, NeurIPS 2014. [arXiv:1409.3215](https://arxiv.org/abs/1409.3215)
+
+**Repo:** https://github.com/Maverick-Ansh/seq2seq-from-scratch
+
+---
+
+### What this notebook is
+
+In 2014, machine translation was done by *phrase-based statistical machine translation* (SMT): a big pipeline of alignment models, phrase tables, language models and a tuned reranker. Dozens of moving parts, each trained separately.
+
+This paper replaced the whole pipeline with **two neural networks and a loop**, and beat the pipeline. That is the moment the field turned. Everything you know today — the Transformer, GPT, the whole encoder/decoder vocabulary — is a descendant of the idea in this 8-page paper.
+
+The idea, in one sentence:
+
+> Read the input sentence one word at a time with an LSTM until you hit the end, keep the network's internal state as a **single fixed-size vector**, and then run a *second* LSTM that is initialised with that vector and whose job is to emit the translation one word at a time.
+
+That's it. Read → squeeze into a vector → unroll.
+
+### How to read this notebook
+
+Nothing here is imported from a library that already solves the problem. We build:
+
+| Chapter | What we build | Paper section |
+|---|---|---|
+| **0** | The machine, and why sequences break ordinary neural nets | §1 |
+| **1** | An LSTM cell from its four equations, proven equal to `nn.LSTM` | — |
+| **2** | Sentences → tensors: vocabulary, `<eos>`, the reversal, length bucketing | §3.1, §3.4 |
+| **3** | Encoder → vector → decoder; the training objective | §2, Eq. 1 |
+| **4** | **Splitting the model across 2 GPUs** — the paper used 8 | §3.5 |
+| **5** | The exact training recipe: SGD 0.7, clip-5, and a normalisation trap | §3.4 |
+| **6** | The **reversal trick**, run as a controlled A/B experiment | §3.3 |
+| **7** | Beam search and BLEU by hand — and a real bug, found by measurement | §3.2, §3.6 |
+| **8** | Ensembling, long sentences, and what is inside the vector | §3.6–3.8 |
+| **9** | What reproduced, what didn't, and what came next | — |
+
+Every code cell has a "**why**" above it, not just a "what". If a line looks arbitrary, the text next to it will tell you which sentence of the paper it came from.
+
+Concepts are defined in [`GLOSSARY.md`](https://github.com/Maverick-Ansh/seq2seq-from-scratch/blob/main/GLOSSARY.md) — if a term here is assumed rather than explained, it's there.
+
+### Two honest caveats up front
+
+**Scale.** The paper trained on **12 million sentence pairs (348M French words)** for **10 days on 8 GPUs**. We have 2 T4s and a session, so we train on **Multi30k (29k sentence pairs)**. Every *mechanism* is reproduced and every *claim about mechanism* is tested. The absolute BLEU will be far below 34.8 — and we measure that gap rather than assert it.
+
+**Not everything reproduces.** Six of the paper's claims reproduce here, two don't. Chapter 9 has the scoreboard. We also found two real bugs in our own code by measurement, and left the debugging in — because the method is worth more than the fix.
+#%%md
+---
+# Chapter 0 — The machine, and the problem
+
+## 0.1 What hardware are we standing on?
+
+Before any deep learning, know your machine. Three numbers decide everything you can attempt:
+
+1. **How many GPUs**, and can they talk to each other directly? (decides Chapter 4)
+2. **Memory per GPU** — this caps model size × batch size × sequence length.
+3. **Compute capability** — decides which number formats are fast. T4 is `sm_75`: it has fp16 tensor cores but **no** bf16. That single fact is why every mixed-precision cell in this notebook says `float16` and not `bfloat16`.
+
+Run the cell below and read the output as a hardware inventory.
+#%%py
+import subprocess, os, sys, torch, socket
+print("host:", socket.gethostname())
+print("KAGGLE env:", sorted(k for k in os.environ if "KAGGLE" in k.upper()))
+print("torch:", torch.__version__, "| cuda:", torch.version.cuda)
+print("device_count:", torch.cuda.device_count())
+for i in range(torch.cuda.device_count()):
+    p = torch.cuda.get_device_properties(i)
+    print(f"  cuda:{i} {p.name} | {p.total_memory/1e9:.1f} GB | cc {p.major}.{p.minor} | SMs {p.multi_processor_count}")
+print(subprocess.run(["nvidia-smi","--query-gpu=index,name,memory.total,driver_version","--format=csv"],capture_output=True,text=True).stdout)
+# peer access matrix (matters for model parallelism)
+n = torch.cuda.device_count()
+print("p2p:", [[torch.cuda.can_device_access_peer(i,j) for j in range(n)] for i in range(n)])
+#%%py
+import socket, urllib.request, os
+socket.setdefaulttimeout(8)
+def probe(url):
+    try:
+        r = urllib.request.urlopen(url, timeout=8)
+        return f"OK {r.status} {url}"
+    except Exception as e:
+        return f"FAIL {type(e).__name__} {url}"
+for u in ["https://pypi.org/simple/", "https://github.com",
+          "https://raw.githubusercontent.com/multi30k/dataset/master/data/task1/raw/train.en.gz"]:
+    print(probe(u))
+print("disk:", os.popen("df -h /kaggle/working | tail -1").read().strip())
+print("cpus:", os.cpu_count())
+#%%md
+### Reading that output
+
+```
+device_count: 2
+  cuda:0 Tesla T4 | 15.6 GB | cc 7.5 | SMs 40
+  cuda:1 Tesla T4 | 15.6 GB | cc 7.5 | SMs 40
+p2p: [[False, True], [True, False]]
+```
+
+* **Two T4s, 15.6 GB each.** Not 31 GB of one GPU — 15.6 GB twice. A model that does not fit in 15.6 GB does not fit, no matter how many GPUs you own, *unless you split the model itself*. That distinction is Chapter 4.
+* **`cc 7.5`** = Turing. fp16 tensor cores: yes. bf16: no. (On this hardware, forcing fp16 is worth ~4× on matmul-heavy work; bf16 silently falls back to slow emulation.)
+* **`p2p: [[False, True], [True, False]]`** — the `True` off the diagonal is the important one. It means `cuda:0` can DMA a tensor straight into `cuda:1`'s memory over PCIe **without staging it through CPU RAM**. Model parallelism is only sane when this is `True`; without it, every layer boundary costs a round trip to the host.
+* **40 SMs** each — a T4 is a small GPU. It is a 70 W inference card, not an A100. Expect to measure things, not to win benchmarks.
+
+`nvidia-smi` agrees with the torch view, and the `KAGGLE_*` environment variables confirm the claim we were given: this really is a Kaggle 2×T4 backend, not a Colab one.
+
+## 0.2 Now the actual problem
+
+Take an ordinary feed-forward network. It is a function
+
+$$f: \mathbb{R}^{n} \to \mathbb{R}^{m}$$
+
+with **fixed** $n$ and **fixed** $m$, baked into the shape of the weight matrices. That is fine for MNIST (784 in, 10 out). It is useless for translation, because:
+
+* the input is a sentence — 3 words or 40 words, and you don't know which until it arrives;
+* the output is a sentence — and **its length is not a function of the input length** you can know in advance;
+* the input is a *sequence*: `dog bites man` and `man bites dog` are the same bag of words and different events, so order carries meaning.
+
+The paper opens on exactly this (§1):
+
+> *"Despite their flexibility and power, DNNs can only be applied to problems whose inputs and targets can be sensibly encoded with vectors of fixed dimensionality."*
+
+An RNN half-solves it: it maps a *sequence* to a *sequence* by carrying state, so it handles variable input length. But a vanilla RNN maps $T$ inputs to $T$ outputs — it needs input and output aligned one-to-one, and translation is not aligned one-to-one.
+
+**The paper's move** is to break the problem into two RNNs so the lengths decouple:
+
+```
+  source:   the   cat   sat  <eos>
+              |     |     |    |
+  ENCODER →  [LSTM][LSTM][LSTM][LSTM]
+                                 ↓
+                          v = (h, c)   ← ONE fixed-size vector. 8000 numbers.
+                                 ↓
+  DECODER →  [LSTM][LSTM][LSTM][LSTM][LSTM]
+               |     |      |     |     |
+  target:     le   chat  s'est assis  <eos>
+```
+
+The encoder runs for $T$ steps, ends, and hands over a fixed-size state. The decoder runs for however many steps it wants and stops when it decides to emit `<eos>`. Input length and output length are now independent, and the `<eos>` symbol is what makes "however many steps it wants" well-defined — **the model learns when to stop**.
+
+Formally, this is the paper's Equation 1:
+
+$$p(y_1,\dots,y_{T'} \mid x_1,\dots,x_T) \;=\; \prod_{t=1}^{T'} p\big(y_t \mid v,\; y_1,\dots,y_{t-1}\big)$$
+
+Read the right-hand side carefully, because the whole design is in it:
+
+* $v$ is the encoder's final state — the *only* thing the decoder ever learns about the source. Nothing else survives. (This is the bottleneck that attention, a year later, would remove.)
+* Each factor is conditioned on **all previously generated words** $y_1..y_{t-1}$, which is what makes the output fluent instead of word-by-word independent.
+* Each factor is a softmax over the whole target vocabulary. The product of $T'$ of them is the sentence probability, and $\log$ of it turns the product into the sum we actually optimise.
+#%%md
+## 0.3 Project setup
+
+All the library code lives in the companion repo so that this notebook stays *readable prose plus experiments*, rather than 2000 lines of class definitions. We clone it and put it on `sys.path`. Every module we pull in is one we wrote in this project — nothing here is `from some_nmt_toolkit import Seq2Seq`.
+
+`sync_repo()` re-pulls the repo and purges our package from `sys.modules`, so edits to the library are picked up without restarting the kernel (a restart on this backend would cost us every GPU tensor we've built). The usual `%load_ext autoreload` is *unusable* on this image: IPython's autoreload still does `from imp import reload`, and `imp` was deleted in Python 3.12. The manual purge is more predictable anyway — it also picks up new *classes*, which autoreload famously does not.
+#%%py
+import os, sys, subprocess, textwrap, time, json, math, random, importlib
+REPO_URL = "https://github.com/Maverick-Ansh/seq2seq-from-scratch.git"
+REPO_DIR = "/kaggle/working/seq2seq-from-scratch"
+
+def sync_repo():
+    """Clone on first call, hard-reset to origin/main afterwards.
+
+    Then PURGE our package from sys.modules so the next `import seq2seq.x`
+    reads the new file. (The usual `%load_ext autoreload` is unusable on this
+    image: IPython's autoreload still does `from imp import reload`, and the
+    `imp` module was deleted in Python 3.12. Manual purge it is — and it is
+    more predictable anyway, since it also picks up new *classes*, which
+    autoreload famously does not.)
+    """
+    if not os.path.isdir(REPO_DIR):
+        subprocess.run(["git", "clone", "-q", REPO_URL, REPO_DIR], check=True)
+    else:
+        subprocess.run(["git", "-C", REPO_DIR, "fetch", "-q", "origin"], check=True)
+        subprocess.run(["git", "-C", REPO_DIR, "reset", "-q", "--hard", "origin/main"], check=True)
+    if REPO_DIR not in sys.path:
+        sys.path.insert(0, REPO_DIR)
+    for name in [m for m in sys.modules if m == "seq2seq" or m.startswith("seq2seq.")]:
+        del sys.modules[name]
+    head = subprocess.run(["git", "-C", REPO_DIR, "log", "-1", "--oneline"],
+                          capture_output=True, text=True).stdout.strip()
+    print("repo @", head)
+
+sync_repo()
+
+# Somewhere to keep figures and result JSON that we later commit to the repo.
+ART = "/kaggle/working/artifacts"
+os.makedirs(ART, exist_ok=True)
+
+# Matplotlib writes figures to disk instead of embedding them in the notebook.
+# (Inline PNGs get base64'd into the .ipynb and bloat it to tens of megabytes.)
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+plt.rcParams.update({"figure.dpi": 130, "font.size": 9, "figure.facecolor": "white"})
+
+def savefig(fig, name):
+    path = os.path.join(ART, name)
+    fig.savefig(path, bbox_inches="tight")
+    plt.close(fig)
+    print("wrote", path, f"({os.path.getsize(path)/1024:.0f} KB)")
+    return path
+
+def save_result(obj, name):
+    """Persist a result dict as JSON so the repo records the numbers, not just
+    the code that would produce them."""
+    path = os.path.join(ART, name)
+    with open(path, "w") as f:
+        json.dump(obj, f, indent=2)
+    print("wrote", path)
+    return path
+
+print("python", sys.version.split()[0], "| artifacts ->", ART)
+#%%md
+---
+# Chapter 1 — The atom: an LSTM, from its four equations
+
+The paper says "we used a deep LSTM" and moves on. We are not going to move on.
+
+## 1.1 The equations
+
+An LSTM carries **two** state tensors from step $t-1$ to step $t$:
+
+| symbol | name | intuition |
+|---|---|---|
+| $c_t$ | cell state | the long-term memory. A conveyor belt that runs the length of the sequence. |
+| $h_t$ | hidden state | the part of memory currently exposed to the outside world (and to the next layer). |
+
+At each step it computes four vectors, all of width $H$:
+
+$$
+\begin{aligned}
+i_t &= \sigma(W_{ii}x_t + b_{ii} + W_{hi}h_{t-1} + b_{hi}) && \textbf{input gate — how much do I write?}\\
+f_t &= \sigma(W_{if}x_t + b_{if} + W_{hf}h_{t-1} + b_{hf}) && \textbf{forget gate — how much do I keep?}\\
+g_t &= \tanh(W_{ig}x_t + b_{ig} + W_{hg}h_{t-1} + b_{hg}) && \textbf{candidate — what would I write?}\\
+o_t &= \sigma(W_{io}x_t + b_{io} + W_{ho}h_{t-1} + b_{ho}) && \textbf{output gate — how much do I reveal?}
+\end{aligned}
+$$
+
+and then the two lines that matter:
+
+$$c_t = f_t \odot c_{t-1} + i_t \odot g_t \qquad\qquad h_t = o_t \odot \tanh(c_t)$$
+
+$\odot$ is elementwise multiply. $\sigma$ squashes to $[0,1]$ — that is what makes $i,f,o$ read as **gates**, i.e. soft on/off switches. $g$ uses $\tanh$ so it is signed: it can push a memory coordinate up *or* down.
+
+Say it in English, one coordinate at a time. Coordinate 37 of $c$ might come to mean *"the subject of this sentence was plural"*. Then:
+- $f_t[37] \approx 1$ → keep remembering it,
+- $i_t[37] \approx 0$ → don't overwrite it with anything from this word,
+- $o_t[37] \approx 0$ → but don't act on it *yet* — hold it privately until the verb arrives, then open $o$ and let it influence the output.
+
+That "hold privately, release later" ability is what $h \ne c$ buys you, and it is why an LSTM has two states instead of one.
+
+## 1.2 Why this beats a plain RNN — the reason the paper is possible at all
+
+A vanilla RNN is $h_t = \tanh(W h_{t-1} + U x_t)$. To get gradient from step $T$ back to step $1$, the chain rule multiplies $T$ Jacobians:
+
+$$\frac{\partial h_T}{\partial h_1} = \prod_{t=2}^{T} \underbrace{\mathrm{diag}(\tanh'(\cdot))}_{\le\,1} W^\top$$
+
+That product behaves like $W^{T}$. If $W$'s largest singular value is below 1 the gradient decays **geometrically** to zero; above 1 it explodes. There is no setting of $W$ that keeps it at 1 for all directions and still computes anything useful. This is the *vanishing gradient problem*, and it means a plain RNN physically cannot learn a dependency 30 steps long.
+
+The LSTM's escape hatch is the $c$ line:
+
+$$\frac{\partial c_t}{\partial c_{t-1}} = f_t \qquad\text{(elementwise — no weight matrix in the path)}$$
+
+If the network learns $f\approx 1$ on some coordinate, gradient flows back through that coordinate essentially **undamped**, for hundreds of steps. This is called the *constant error carousel*. It is the entire reason a 4-layer LSTM can read a 30-word sentence and still remember its first word — and therefore the entire reason this paper works.
+
+We are about to measure that claim rather than believe it.
+
+## 1.3 First: is our implementation actually an LSTM?
+
+Writing the equations is easy. Writing them *correctly* is where people quietly lose a week — a permuted gate order or an accidental `.detach()` produces a model that trains, badly, forever, with no error message.
+
+So we test properly. We copy weights out of PyTorch's `nn.LSTM` into ours, run both on identical inputs, and compare **both the forward outputs and the gradients**. Gradients are the real test: a forward-only match can hide a broken backward pass.
+
+We run in `float64`. In `float32` two correct implementations differ by ~1e-6 just from the order GPUs sum things in, which makes "is it right?" a judgement call. In `float64`, correct agrees to ~1e-13 and wrong does not.
+#%%py
+import torch
+from seq2seq.lstm import (LSTMCellScratch, LSTMLayerScratch, DeepLSTMScratch,
+                          verify_against_torch, grad_flow_demo)
+
+res = verify_against_torch(T=17, B=5, I=11, H=13, L=4, dtype=torch.float64)
+print("scratch DeepLSTM  vs  nn.LSTM   (float64, 4 layers, 17 timesteps)")
+print("-" * 62)
+for k, v in res.items():
+    verdict = "OK" if v < 1e-10 else "MISMATCH"
+    print(f"  {k:28s} {v:.3e}   {verdict}")
+assert max(res.values()) < 1e-10, "our LSTM is not nn.LSTM"
+print("\nOur LSTM is the same function as PyTorch's, forward and backward.")
+#%%md
+## 1.4 Measuring the gradient highway
+
+**The experiment.** Feed a 100-step sequence into (a) a vanilla RNN and (b) our LSTM. Put a loss on the **last timestep only**. Then look at $\left\lVert \partial \mathcal{L} / \partial x_t \right\rVert$ for every $t$.
+
+That norm answers a very concrete question: *how much does the input at step $t$ still influence the output at step 100?* If it is $10^{-8}$, then in float32 that dependency is numerically invisible to the optimiser — the model **cannot** learn it, no matter how long you train. We normalise so the last step reads 1.0, and plot on a log axis.
+
+Keep the translation task in mind while you read the plot. To translate a 25-word sentence, the encoder's *first* word must still influence the decoder's *first* word — a gap of 25+ steps. Whether that is learnable is exactly what this plot decides.
+#%%py
+import numpy as np
+sync_repo()                                   # pull the latest seq2seq/ code
+from seq2seq.lstm import grad_flow_demo
+
+gf   = grad_flow_demo(T=100, B=4, H=64, forget_biases=[0.0, 1.0, 3.0])
+T    = gf["T"]
+back = np.arange(T)[::-1]                     # 0 = final step, 99 = first step
+rnn  = np.array(gf["rnn"])
+lstm = {k: np.array(v) for k, v in gf["lstm"].items()}
+
+hdr = f"{'steps back':>11} | {'vanilla RNN':>12} |" + "".join(
+    f" {'LSTM b_f='+k:>13} |" for k in lstm)
+print(hdr); print("-" * len(hdr))
+for k in [10, 20, 30, 50, 99]:
+    row = f"{k:>11} | {rnn[T-1-k]:12.2e} |"
+    for c in lstm.values():
+        row += f" {c[T-1-k]:13.2e} |"
+    print(row)
+
+def horizon(curve, floor=1e-6):
+    """How many steps back before the signal drops under the float32 noise
+    floor — i.e. the model's effective learnable memory span."""
+    dead = np.where(curve[::-1] < floor)[0]
+    return int(dead[0]) if len(dead) else T
+
+print("\neffective memory span (steps until gradient < 1e-6 of final):")
+print(f"   vanilla RNN            : {horizon(rnn)}")
+for k, c in lstm.items():
+    print(f"   LSTM, forget bias {k:>4} : {horizon(c)}")
+
+fig, ax = plt.subplots(figsize=(6.6, 3.6))
+ax.semilogy(back, rnn, label="vanilla RNN", lw=2, color="#c0392b")
+for (k, c), col in zip(lstm.items(), ["#85c1e9", "#3498db", "#1b4f72"]):
+    ax.semilogy(back, c, label=f"LSTM, forget bias {k}", lw=1.8, color=col)
+ax.axhline(1e-6, ls=":", c="grey", lw=1)
+ax.text(98, 2e-6, "float32 noise floor", fontsize=7, color="grey")
+ax.axvspan(0, 30, color="#f1c40f", alpha=0.12)
+ax.text(15, 1e-20, "a sentence is\nabout this long", ha="center", fontsize=7, color="#7d6608")
+ax.invert_xaxis(); ax.set_ylim(1e-24, 5)
+ax.set_xlabel("timesteps back from the loss")
+ax.set_ylabel(r"$\|\partial \mathcal{L}/\partial x_t\|$  (normalised)")
+ax.set_title("How far back can gradient actually travel?")
+ax.legend(frameon=False, fontsize=7.5); ax.grid(alpha=0.25)
+savefig(fig, "fig01_gradient_flow.png")
+save_result({"rnn": gf["rnn"], "lstm": gf["lstm"],
+             "horizons": {"rnn": horizon(rnn),
+                          **{f"lstm_bf{k}": horizon(c) for k, c in lstm.items()}}},
+            "ch1_gradient_flow.json");
+#%%md
+### What just happened — read this carefully, it is the most important idea in Chapter 1
+
+```
+effective memory span (steps until gradient < 1e-6 of final):
+   vanilla RNN            : 18
+   LSTM, forget bias  0.0 : 26
+   LSTM, forget bias  1.0 : 61
+   LSTM, forget bias  3.0 : 100        <- gradient at 99 steps back is still 0.37
+```
+
+Look at the first two rows. A freshly initialised LSTM is only ~1.4× better than a vanilla RNN. If someone told you "LSTMs solve the vanishing gradient problem", that row is embarrassing. **So let's be precise about what is actually true.**
+
+At initialisation every pre-activation is near zero, so the forget gate sits at $f = \sigma(0) = 0.5$. The memory line therefore multiplies by $0.5$ every step, and $0.5^{30}\approx10^{-9}$. **The decay is not a property of the architecture. It is a property of that particular point in parameter space.**
+
+Now look at the last row. Set the forget-gate bias to 3, so $f=\sigma(3)=0.95$, and $0.95^{100}\approx0.006$ — and empirically the gradient at 99 steps back is **0.37**, essentially undamped. Same architecture. Same weights (we re-seeded identically). One bias changed.
+
+So the honest statement is:
+
+> **An LSTM does not avoid vanishing gradients. It contains a region of parameter space where gradients do not vanish, and gradient descent can walk into that region because the forget gate is made of learnable parameters.**
+>
+> A vanilla RNN has no such region. To stop its gradient decaying you must push $W$'s spectral radius to 1 — but the same $W$ also drives the forward pass, so you simultaneously make activations blow up. The RNN cannot decouple "remember" from "compute". The LSTM can, because $f$ and $g$ are separate gates.
+
+This is why practitioners initialise the forget bias to 1 or 2 (Jozefowicz et al. 2015) — you are placing the model *inside* the good region instead of asking it to find its way there through a $10^{-9}$ gradient. Chicken and egg: you need long-range gradient to learn long-range gradient.
+
+**And now the bridge to §3.3 of the paper.** Notice the yellow band: a real sentence is 20–35 tokens, sitting right where the untrained curves fall off a cliff. Sutskever et al. didn't have a magic fix for that. What they had was a trick to *move the important dependencies out of the cliff* — reverse the source sentence, so that the first word of the source ends up adjacent to the first word of the target. That is Chapter 6, and you now understand exactly why it works before we even run it.
+
+📊 `artifacts/fig01_gradient_flow.png`
+#%%md
+---
+# Chapter 2 — From sentences to tensors
+
+## 2.1 The data, and an honest scaling note
+
+| | paper (§3.1) | us |
+|---|---|---|
+| corpus | WMT'14 En→Fr | Multi30k En→Fr |
+| sentence pairs | 12,000,000 | ~29,000 |
+| French words | 348,000,000 | ~380,000 |
+| source vocab | 160,000 | 10,000 |
+| target vocab | 80,000 | 10,000 |
+| hardware | 8 GPUs, 10 days | 2 T4s, one session |
+
+**400× less data.** Say that out loud, because it sets what we can and cannot claim. Every *mechanism* in the paper reproduces here. The absolute BLEU will not.
+
+Multi30k is image captions, so its sentences are short and its French is simple. That is a feature for a teaching repo: it means a model small enough to iterate on can actually learn something, so the experiments give signal instead of noise.
+
+## 2.2 Four decisions, all of them the paper's
+
+**1. A closed vocabulary.** The output layer is a softmax over the target vocabulary, so vocabulary size is literally a matrix dimension — you must pick a number and freeze it. Everything outside becomes `<unk>`. The paper used 160k/80k; the price it pays is that any word outside them can never be produced, which §3.6 flags as a real limit on its BLEU. We report *token coverage* so you can see what we're paying.
+
+**2. Build the vocabulary from the training set only.** If test-set words get real embeddings, your test score is measuring a model that peeked. This is one of the most common silent leaks in NLP.
+
+**3. Every sentence ends with `<eos>`.** Paper §2 says this "enables the model to define a distribution over sequences of all possible lengths". It is not bookkeeping: on the target side, emitting `<eos>` is *how the model decides to stop*. Without it, generation has no defined end and you'd have to cut it off arbitrarily.
+
+**4. The source may be reversed.** `encode_pair(..., reverse_source=True)` flips the source word order and leaves the target alone. This is §3.3, and Chapter 6 is nothing but a controlled test of it.
+#%%py
+sync_repo()
+from seq2seq import data as D
+
+t0 = time.time()
+corpus = D.load_corpus(root="/kaggle/working/data/multi30k", langs=("en", "fr"),
+                       src_vocab_size=10_000, tgt_vocab_size=10_000, min_freq=2)
+print(f"loaded in {time.time()-t0:.1f}s\n")
+st = corpus.stats()
+for k, v in st.items():
+    print(f"{k:22s} {v}")
+
+print("\n--- a real training pair, at each stage of processing ---")
+en, fr = corpus.train[7]
+print("english tokens :", en)
+print("french  tokens :", fr)
+
+for rev in (False, True):
+    s_ids, t_ids = D.encode_pair(en, fr, corpus, reverse_source=rev)
+    tag = "REVERSED" if rev else "forward "
+    print(f"\nsource {tag}: {s_ids}")
+    print(f"        -> {corpus.src_vocab.decode(s_ids, strip_specials=False)}")
+print(f"\ntarget         : {t_ids}")
+print(f"        -> {corpus.tgt_vocab.decode(t_ids, strip_specials=False)}")
+save_result(st, "ch2_corpus_stats.json");
+#%%md
+### Read the output — two things are visible in it
+
+**(a) The vocabulary is doing its job, visibly.** `branchée` ("trendy") appears once in 29,000 sentences, so with `min_freq=2` it is not in the vocabulary and became `<unk>`. Our coverage is 98.3%, i.e. roughly **one `<unk>` every 60 tokens** — about one in every four sentences has a hole in it. That is a hard ceiling on translation quality that no amount of training removes, and it is the small version of the exact problem §3.6 of the paper complains about with its 80k vocabulary.
+
+Note also: we asked for 10,000 words and got 5,898/6,434. `min_freq=2` bound before the size cap did — over half the word types in this corpus appear exactly once. That's Zipf's law, and it's why vocabulary size has diminishing returns.
+
+**(b) The reversal trick, in one concrete sentence.** Compare:
+
+```
+forward  : a  trendy girl ... street .  <eos>
+target   : une fille branchée ...
+             ^--- "une" must be predicted from a state produced 15 steps after "a"
+
+REVERSED : .  street ... girl trendy a  <eos>
+target   : une fille branchée ...
+             ^--- "une" is now predicted ~1 step after the encoder read "a"
+```
+
+`a → une` is the very first alignment the model has to learn. Forward, those two tokens are **15 timesteps apart**. Reversed, they are **adjacent**. Chapter 1's plot told you what a 15-step gap costs at initialisation: about four orders of magnitude of gradient. A 1-step gap costs nothing.
+
+The average distance between a source word and its translation is *identical* in both orderings — the tail words got worse by exactly what the head words gained. What changed is the **minimum**. The paper's claim (§3.3) is that optimisation cares about the minimum, because once backprop finds *any* short path between the two sentences, everything else can be bootstrapped from it:
+
+> *"...by introducing many short term dependencies between the source and the target sentence... backpropagation has an easier time 'establishing communication' between the source sentence and the target sentence."*
+
+We test this in Chapter 6 by changing exactly one boolean.
+
+## 2.3 Batching: why sentences of similar length go together
+
+Paper §3.4:
+
+> *"...we made sure that all sentences in a minibatch are roughly of the same length, yielding a 2x speedup."*
+
+A minibatch is a **rectangle**. If a batch holds one 40-token sentence and 127 six-token sentences, the rectangle is 40 wide and ~85% of it is padding. For an RNN this is worse than for a feed-forward net, because the number of *sequential timesteps* is set by the longest member — the batch doesn't merely waste FLOPs, it **waits**, and the padded steps cannot be parallelised away.
+
+Naively, sort everything by length. But then every epoch produces identical batches in identical order, and each batch is topically homogeneous (all the short captions together), which biases the gradient. The standard compromise, which is what `bucket_batches` implements:
+
+1. shuffle the corpus,
+2. cut into **pools** of `batch_size × bucket_multiplier`,
+3. sort *within* a pool by length,
+4. cut each pool into batches → each batch is nearly uniform,
+5. shuffle the **order** of the batches.
+
+`bucket_multiplier` is the dial: `1` = pure shuffle (maximum padding), `∞` = global sort (minimum padding, least randomness). Let's turn the dial and measure.
+#%%py
+train_ids = D.encode_split(corpus.train, corpus, reverse_source=True)
+BS = 128                                     # the paper's minibatch size (§3.4)
+
+print(f"{'bucket_mult':>12} | {'batches':>7} | {'token eff.':>10} | "
+      f"{'seq. timesteps':>14} | {'speedup vs mult=1':>18}")
+print("-" * 76)
+rows = {}
+base_steps = None
+for mult in [1, 2, 5, 10, 20, 50, 100, 1000]:
+    b = D.bucket_batches(train_ids, BS, shuffle=True, seed=0, bucket_multiplier=mult)
+    s = D.padding_stats(b)
+    if base_steps is None:
+        base_steps = s["sequential_timesteps"]
+    s["speedup"] = round(base_steps / s["sequential_timesteps"], 3)
+    rows[mult] = s
+    print(f"{mult:>12} | {s['num_batches']:>7} | {s['token_efficiency']:>10.3f} | "
+          f"{s['sequential_timesteps']:>14,} | {s['speedup']:>18.2f}x")
+
+fig, (a1, a2) = plt.subplots(1, 2, figsize=(8.4, 3.0))
+ms = list(rows)
+a1.semilogx(ms, [rows[m]["token_efficiency"] for m in ms], "o-", color="#2471a3")
+a1.set_xlabel("bucket multiplier (pool = 128 x this)"); a1.set_ylabel("real tokens / rectangle cells")
+a1.set_title("How much of the batch is real data?"); a1.grid(alpha=0.3); a1.set_ylim(0, 1)
+a2.semilogx(ms, [rows[m]["speedup"] for m in ms], "o-", color="#c0392b")
+a2.axhline(2.0, ls="--", c="grey", lw=1); a2.text(1.2, 2.03, "paper: 2x", fontsize=7, color="grey")
+a2.set_xlabel("bucket multiplier"); a2.set_ylabel("x fewer sequential timesteps")
+a2.set_title("Speedup from length bucketing"); a2.grid(alpha=0.3)
+savefig(fig, "fig02_bucketing.png")
+save_result({str(k): v for k, v in rows.items()}, "ch2_bucketing.json");
+#%%md
+### The paper's 2× — reproduced, on the nose
+
+```
+bucket_mult |  token eff. | seq. timesteps | speedup
+          1 |       0.477 |         14,760 |   1.00x     <- pure shuffle
+         50 |       0.875 |          8,062 |   1.83x     <- what we will train with
+       1000 |       0.959 |          7,372 |   2.00x     <- effectively a global sort
+```
+
+With no bucketing, **52% of every tensor we build is padding**. The GPU spends more than half its cycles multiplying zeros by weights. Sort by length and that falls to 4%.
+
+The right-hand column is the one the paper is quoting. "Sequential timesteps" = $\sum_\text{batches} (S_\text{max} + T_\text{max})$, i.e. the total number of times the recurrence loop body has to execute in an epoch. For an RNN this tracks wall-clock almost exactly, because those steps are *serial* — no amount of GPU parallelism removes them. Going from shuffled to sorted takes it from 14,760 to 7,372: **exactly the 2.00× the paper reports.**
+
+Two takeaways worth keeping:
+
+- **A batch's cost is set by its worst member.** This is the general lesson, and it outlives RNNs — it's why modern LLM serving does continuous batching, and why ragged sequences get so much engineering attention.
+- **We use `bucket_multiplier=50`** — 1.83× of the available 2.00×, while keeping the shuffling that stochastic gradient descent needs to actually be stochastic. Taking the last 9% would mean training on a fixed batch order every epoch. Not worth it.
+
+📊 `artifacts/fig02_bucketing.png`
+
+*(Remember this cell. In Chapter 7 it turns out that this very optimisation introduced a bug — because it narrowed the distribution the encoder was trained on.)*

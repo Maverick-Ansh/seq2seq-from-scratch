@@ -1,0 +1,594 @@
+#%%md
+---
+# Chapter 3 — The architecture: read → squeeze → unroll
+
+## 3.1 The three pieces
+
+```
+   src (S,B) ──▶ src_embed ──▶ ENCODER LSTM ──▶ v = (h,c)   [L,B,H] × 2
+                                                    │
+                                                    ▼  (used as the initial state)
+   tgt_in (T,B) ─▶ tgt_embed ─▶ DECODER LSTM ──▶ GENERATOR ──▶ logits (T,B,V)
+```
+
+**Encoder.** Reads the source and is then thrown away — *except* for its final `(h, c)`. That pair is $v$. Notice what we do **not** keep: the encoder's per-timestep outputs are computed and immediately discarded. Keeping them, and letting the decoder look back at them, is precisely what attention (Bahdanau et al., a year later) added. In this model there is no looking back.
+
+**Decoder.** A *second*, separate LSTM. Paper §2:
+
+> *"we used two different LSTMs: one for the input sequence and another for the output sequence, because doing so increases the number of model parameters at negligible computational cost and makes it natural to train the LSTM on multiple language pairs simultaneously."*
+
+Two 32M-parameter stacks instead of one shared 32M. Compressing English and generating French are different jobs; give each its own weights.
+
+**Generator.** A linear map from hidden state to vocabulary logits. In the paper this is $1000 \times 80000$ — **80M parameters, more than the entire recurrent network**, and the single most expensive operation in the model. Hold onto that fact; it is why §3.5 dedicates half its GPUs to it, and it is why Chapter 4 shards it.
+
+## 3.2 The bottleneck — stare at this before moving on
+
+Everything the decoder will ever learn about the English sentence must pass through $v$. For the paper's model that is
+
+$$4 \text{ layers} \times 1000 \text{ units} \times 2 \text{ tensors } (h, c) = \textbf{8000 numbers}$$
+
+and it is **the same 8000 numbers whether the source is 3 words or 80.** A 3-word sentence gets 2600 numbers per word; an 80-word sentence gets 100. There is no mechanism that gives long sentences more room.
+
+This is *the* known weakness of the architecture, and the paper is upfront about testing it — §3.7 measures BLEU as a function of sentence length specifically to see whether the bottleneck bites (we reproduce that measurement in Chapter 8). The surprising finding, which the authors clearly did not take for granted, is that it mostly doesn't at these lengths.
+
+## 3.3 A note on `scratch=True`
+
+Our `Seq2Seq` takes a `scratch` flag. `True` uses the hand-written Python-loop LSTM from Chapter 1; `False` uses cuDNN's `nn.LSTM`. We proved in Chapter 1 that they compute the same function to 1e-16, so **using the fast one is not a compromise — it is the payoff for having done the proof.**
+#%%py
+sync_repo()
+import torch
+from seq2seq.model import Seq2Seq, sequence_loss, count_parameters, paper_config
+
+def show_params(cfg, label):
+    m = Seq2Seq(**cfg)
+    p = count_parameters(m)
+    tot = p["total"]
+    print(f"\n{label}   ({cfg['num_layers']} layers x {cfg['hidden_dim']} units, "
+          f"vocab {cfg['src_vocab']}/{cfg['tgt_vocab']})")
+    for k in ["src_embedding", "tgt_embedding", "encoder_lstm", "decoder_lstm",
+              "generator_softmax"]:
+        print(f"   {k:20s} {p[k]:>12,}   {100*p[k]/tot:5.1f}%")
+    print(f"   {'TOTAL':20s} {tot:>12,}")
+    print(f"   {'of which recurrent':20s} {p['recurrent_only']:>12,}   "
+          f"{100*p['recurrent_only']/tot:5.1f}%")
+    print(f"   fp32 weights alone: {tot*4/1e9:.2f} GB")
+    del m
+    return p
+
+paper_p = show_params(paper_config(), "PAPER §3.4")
+print("\n   paper states 384M parameters, 64M of them recurrent (32M+32M).")
+print(f"   we compute {paper_p['total']/1e6:.0f}M total, "
+      f"{paper_p['recurrent_only']/1e6:.0f}M recurrent.  <- matches")
+
+OURS = dict(src_vocab=len(corpus.src_vocab), tgt_vocab=len(corpus.tgt_vocab),
+            emb_dim=512, hidden_dim=512, num_layers=4, dropout=0.2)
+ours_p = show_params(OURS, "OURS")
+save_result({"paper": paper_p, "ours": ours_p, "ours_config": OURS}, "ch3_params.json");
+#%%md
+### The parameter count reproduces the paper exactly — and tells you where the model really lives
+
+Paper §3.4: *"384M parameters of which 64M are pure recurrent connections (32M for the encoder LSTM and 32M for the decoder LSTM)."*
+
+We build the config and count: **384,144,000 total, 64,064,000 recurrent (32,032,000 each).** That's not an approximation, it's the same model. Small check, but the kind that catches a wrong layer count before you waste a training run on it.
+
+Now the interesting part:
+
+```
+   src_embedding         160,000,000    41.7%   ← a lookup table
+   tgt_embedding          80,000,000    20.8%   ← a lookup table
+   generator_softmax      80,080,000    20.8%   ← one matmul
+   encoder_lstm           32,032,000     8.3%
+   decoder_lstm           32,032,000     8.3%   ← the "deep LSTM" everyone talks about
+```
+
+**83% of this model is vocabulary.** The recurrent network — the thing the paper is named after, the thing every diagram draws — is 17% of the parameters.
+
+This dictates the engineering:
+
+- **Embeddings are cheap in FLOPs, expensive in memory.** An embedding lookup touches one row per token. 240M parameters, almost no compute. They eat RAM, not time.
+- **The generator is the opposite: 80M parameters, and it runs on *every* output position.** For batch 128 × 30 timesteps that is 3,840 separate 1000→80,000 projections per step. By a wide margin the most expensive *operation* in the model. **This is why §3.5 spends four of its eight GPUs on the softmax alone** — a decision that looks arbitrary until you count.
+- **Our model inverts the ratio** (64% recurrent) purely because our vocabulary is 6k instead of 160k. Our model is *structurally* a different beast, and conclusions about where time goes do not transfer between them.
+
+`fp32 weights alone: 1.54 GB` for the paper's model. Remember that number — Chapter 4 opens by trying to actually train it on one T4.
+#%%md
+---
+# Chapter 4 — Distributing the work across 2 GPUs
+
+Read §3.5 of the paper first, in full, because every clause in it is a decision:
+
+> *"A C++ implementation of deep LSTM with the configuration from the previous section on a single GPU processes a speed of approximately **1,700 words per second**. This was too slow for our purposes, so we parallelized our model using an **8-GPU machine**. **Each layer of the LSTM was executed on a different GPU** and communicated its activations to the next GPU / layer **as soon as they were computed**. Our models have 4 layers of LSTMs, each of which resides on a separate GPU. **The remaining 4 GPUs were used to parallelize the softmax**, so each GPU was responsible for multiplying by a **1000 × 20000** matrix. The resulting implementation achieved a speed of **6,300 words per second** with a minibatch size of 128. Training took about **ten days**."*
+
+Decode it:
+
+| clause | what it actually means |
+|---|---|
+| "each layer on a different GPU" | **layer-wise model parallelism** — 4 GPUs, one LSTM layer each |
+| "the remaining 4 to parallelize the softmax" | **tensor parallelism** over the vocabulary axis: 80,000 ÷ 4 = 20,000 columns each — that's where "1000 × 20000" comes from |
+| "as soon as they were computed" | **pipelining** — layer $k{+}1$ starts on timestep $t$ while layer $k$ is on $t{+}1$ |
+| 1,700 → 6,300 words/sec | **3.7× from 8 GPUs.** Not 8×. |
+
+That last row is the honest headline of this chapter. Parallelism is not free, and understanding *why the number is 3.7 and not 8* is worth more than any amount of API knowledge.
+
+## 4.1 First principles: what actually lives on a GPU during training
+
+Beginners count the weights and stop. There are four things:
+
+| what | size | notes |
+|---|---|---|
+| **weights** | $N \times 4$ bytes | fp32 |
+| **gradients** | $N \times 4$ bytes | one number per weight — you always pay this twice |
+| **optimizer state** | SGD: **0** · SGD+momentum: $N{\times}4$ · Adam: $2N{\times}4$ | |
+| **activations** | $\propto$ batch × seq_len × hidden | everything backward needs; scales with *data*, not parameters |
+
+Now re-read one line of §3.4: *"stochastic gradient descent **without momentum**"*. On a 384M-parameter model that choice alone saves **1.5 GB** versus momentum and **3.1 GB** versus Adam. In 2014, on 12 GB cards, that was not a stylistic preference — it was the difference between fitting and not fitting.
+#%%py
+sync_repo()
+from seq2seq.parallel import (memory_budget, activation_estimate, gpu_mem,
+                              ModelParallelSeq2Seq, timed_steps,
+                              vocab_parallel_cross_entropy)
+
+N_PAPER = 384_144_000
+print("PAPER MODEL — static memory, by optimizer choice")
+print(f"{'optimizer':>12} | {'weights':>8} | {'grads':>8} | {'opt state':>10} | {'total':>8}")
+print("-" * 56)
+for opt in ["sgd", "momentum", "adam"]:
+    b = memory_budget(N_PAPER, opt)
+    print(f"{opt:>12} | {b['weights_GB']:7.2f}G | {b['gradients_GB']:7.2f}G | "
+          f"{b['optimizer_state_GB']:9.2f}G | {b['subtotal_GB']:7.2f}G")
+
+print("\nPAPER MODEL — activation memory for one batch (B=128, T=30, H=1000, L=4)")
+a = activation_estimate(batch=128, seq_len=30, hidden=1000, layers=4, vocab=80_000)
+for k, v in a.items():
+    print(f"   {k:24s} {v}")
+
+print("\nOUR MODEL — same arithmetic (B=128, T=30, H=512, L=4, V=6434)")
+a_ours = activation_estimate(batch=128, seq_len=30, hidden=512, layers=4,
+                             vocab=len(corpus.tgt_vocab))
+for k, v in a_ours.items():
+    print(f"   {k:24s} {v}")
+
+total_paper = memory_budget(N_PAPER, "sgd")["subtotal_GB"] + a["total_GB"]
+print(f"\nPAPER total for one training step, one GPU:  {total_paper:.2f} GB")
+print(f"A single Tesla T4 has:                      15.6 GB  "
+      f"-> {'FITS (barely)' if total_paper < 15.6 else 'DOES NOT FIT'}")
+print(f"A 2014 Tesla K40 (what they had) has:       12.0 GB  "
+      f"-> {'fits' if total_paper < 12.0 else 'DOES NOT FIT'}")
+save_result({"paper_static": {o: memory_budget(N_PAPER, o) for o in ['sgd','momentum','adam']},
+             "paper_activations": a, "our_activations": a_ours,
+             "paper_step_total_GB": total_paper}, "ch4_memory_budget.json");
+#%%md
+### Two surprises in that output
+
+**Surprise 1: the paper's model *fits* on one 2014 GPU.** 5.90 GB against a K40's 12 GB. So the usual story — "they used 8 GPUs because the model didn't fit" — is **wrong**, and the paper never claims it. Re-read the first sentence of §3.5:
+
+> *"...processes a speed of approximately 1,700 words per second. **This was too slow for our purposes**, so we parallelized our model..."*
+
+They parallelised for **throughput**, not capacity. At 1,700 words/sec, 348M French words × 7.5 epochs ≈ **48 days**. At 6,300 words/sec it's ten. That is the entire motivation. Getting this right matters, because *the reason you parallelise determines which parallelism you should choose*.
+
+**Surprise 2: 87% of the paper's activation memory is the logits tensor.**
+
+```
+   lstm_activations_GB      0.37
+   logits_GB                2.46      <- 87% of activations
+```
+
+The `(T, B, V)` logits at $30\times128\times80{,}000$ are 2.46 GB in fp32. The four-layer LSTM everyone draws diagrams of is 0.37 GB. **The softmax is the model, computationally speaking** — and that is why four of the paper's eight GPUs are assigned to it.
+
+Note our model has `logits_share = 0.51` instead of 0.87, purely because our vocabulary is 6,434 instead of 80,000.
+
+### 4.2 Let's actually build the paper's model and run it
+
+Estimates are estimates. Build the real 384M-parameter model on one T4, run a real forward+backward, and measure peak memory and throughput.
+#%%py
+import gc
+def free():
+    gc.collect()
+    for i in range(torch.cuda.device_count()):
+        torch.cuda.synchronize(i); torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats(i)
+
+def try_paper_model_single_gpu(B=128, S=30, T=30, dev="cuda:0"):
+    """Build the paper's exact §3.4 model on ONE T4 and run a training step."""
+    free()
+    cfg = paper_config()
+    try:
+        m = Seq2Seq(**cfg).to(dev)
+        opt = torch.optim.SGD(m.parameters(), lr=0.7)   # no momentum, as §3.4
+        src    = torch.randint(4, cfg["src_vocab"], (S, B), device=dev)
+        tgt_in = torch.randint(4, cfg["tgt_vocab"], (T, B), device=dev)
+        tgt_out= torch.randint(4, cfg["tgt_vocab"], (T, B), device=dev)
+
+        def step():
+            opt.zero_grad(set_to_none=True)
+            loss = sequence_loss(m(src, tgt_in), tgt_out)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(m.parameters(), 5.0)
+            opt.step()
+
+        sec = timed_steps(step, n_warmup=2, n_iters=5)
+        # "words per second": the paper counts BOTH English and French words,
+        # so one step processes B*(S+T) words.
+        wps = B * (S + T) / sec
+        out = {"ok": True, "sec_per_step": round(sec, 4), "words_per_sec": int(wps),
+               **{k: round(v, 2) for k, v in gpu_mem(dev).items()}}
+        del m, opt, src, tgt_in, tgt_out
+        free()
+        return out
+    except torch.cuda.OutOfMemoryError as e:
+        free()
+        return {"ok": False, "error": "CUDA OOM", "detail": str(e)[:200]}
+
+r = try_paper_model_single_gpu()
+print("PAPER MODEL (384M params), one Tesla T4, batch 128, 30+30 tokens")
+for k, v in r.items():
+    print(f"   {k:18s} {v}")
+if r["ok"]:
+    print(f"\n   paper, 1 GPU (2014, C++/K40) : 1,700 words/sec")
+    print(f"   us,    1 GPU (2026, T4)      : {r['words_per_sec']:,} words/sec")
+    print(f"   paper, 8 GPUs                : 6,300 words/sec")
+    days = 348e6 * 2 * 7.5 / r["words_per_sec"] / 86400
+    print(f"\n   at our single-T4 rate, the paper's 7.5 epochs over 12M pairs")
+    print(f"   would take {days:.0f} days.")
+save_result(r, "ch4_paper_model_single_gpu.json");
+#%%md
+### Read this result twice
+
+```
+   peak_GB            6.02          (we predicted 5.90 — the arithmetic was right to 2%)
+   words_per_sec      7,250
+
+   paper, 1 GPU (2014, C++/K40) : 1,700 words/sec
+   us,    1 GPU (2026, T4)      : 7,250 words/sec
+   paper, 8 GPUs                : 6,300 words/sec
+```
+
+**One Tesla T4 — a 70-watt inference card, the cheapest GPU Kaggle hands out for free — runs the paper's model faster than the entire 8-GPU machine that produced the published result.** Their ten-day training run is about eight days on this single card, and well under a day on a modern A100/H100.
+
+Sit with that, because it is the most useful thing in this chapter:
+
+1. **The hardware did the heavy lifting.** A 2014 K40 was ~4.3 TFLOP/s fp32; a T4 is ~8 fp32 and ~65 on fp16 tensor cores, with far better memory bandwidth and a decade of cuDNN kernel engineering behind it. The algorithm didn't change; the silicon did.
+2. **Our memory arithmetic was right to 2%** (5.90 predicted vs 6.02 measured). "Will it fit?" is a question with an answer — you compute it, you don't discover it by crashing.
+3. **Be suspicious of parallelism-by-default.** Everything below studies what a second GPU buys. The correct first question is always *"do I need more than one?"*, and here in 2026 the answer is no.
+
+So why continue? Because the *techniques* are exactly the ones that scale to models where the answer is yes. The vocabulary-sharded softmax below is the same trick Megatron-LM uses today for a 128k-vocab LLM head. The bubble arithmetic is what decides pipeline schedules on a 1000-GPU cluster.
+
+## 4.3 The three ways to use a second GPU
+
+| | **Data parallel** | **Model / tensor parallel** | **Pipeline parallel** |
+|---|---|---|---|
+| what's on each GPU | a full **copy** of the model | a **different piece** of the model | a different piece + micro-batches |
+| what's split | the **batch** | the **model** | both |
+| solves | throughput | model doesn't fit | the idle bubble model parallelism creates |
+| what crosses the bus | **gradients**, $O(\text{params})$, once per step | **activations**, $O(B{\times}T{\times}H)$, at every cut | same as model parallel |
+| both GPUs busy? | yes, naturally | **no — ~50% idle each** | yes |
+
+The trap is row 5. Naive layer-wise model parallelism produces this:
+
+```
+  cuda:0  [==== stage 0 ====]                       idle
+  cuda:1                       idle          [==== stage 1 ====]
+```
+
+Stage 1 cannot start until stage 0 finishes, so **each GPU idles half the time and two GPUs do one GPU's worth of work** — less, once you count the PCIe hop. This is a large part of why the paper's 8 GPUs gave 3.7×, not 8×.
+
+The fix is in the paper, in five words: *"as soon as they were computed."* Don't wait for the whole batch — hand each chunk downstream the moment it's ready:
+
+```
+  cuda:0  [s0 m1][s0 m2][s0 m3][s0 m4]
+  cuda:1         [s1 m1][s1 m2][s1 m3][s1 m4]
+```
+
+With $S$ stages and $M$ micro-batches, utilisation is $\frac{M}{M+S-1}$ — the GPipe bubble formula. $M{=}1$: 50%. $M{=}4$: 80%. $M{=}8$: 89%. We'll measure all of it.
+
+### 4.3.1 The sharded softmax, and the mistake almost everyone makes
+
+Splitting the generator's $(H, V)$ matrix across devices is easy. Computing the **loss** afterwards is where people go wrong.
+
+The naive approach: move every shard's logits to one GPU, `torch.cat`, call `cross_entropy`. At the paper's dimensions the shards collectively return a $(30, 128, 80{,}000)$ tensor — **1.23 GB per step**. Over PCIe at ~12 GB/s that's ~100 ms of pure transfer, every step, in each direction. **The gather costs more than the sharding saved.**
+
+The right approach uses the fact that cross-entropy needs only two scalars per position:
+
+$$\mathcal{L} = -\big(z_{\text{target}} - \operatorname{logsumexp}(z)\big)$$
+
+and both can be assembled from per-shard partial reductions:
+
+1. each shard takes its local max over its vocabulary slice → $(T,B)$
+2. all-reduce **max** → global max
+3. each shard computes $\sum \exp(z - \text{max})$ over its slice → $(T,B)$
+4. all-reduce **sum**
+5. $\operatorname{logsumexp} = \text{max} + \log(\text{sum})$
+6. whichever shard owns the target id contributes $z_{\text{target}}$; the others contribute 0
+
+(Step 1 isn't only about bandwidth — subtracting the global max before exponentiating is what stops `exp` overflowing to `inf`. Logits routinely reach +30, and `exp(90)` is not a number.)
+
+The general principle is worth writing on a wall: **don't move a tensor to reduce over it — move the reduction.** That's `vocab_parallel_cross_entropy` in `seq2seq/parallel.py`, and it's what Megatron-LM does for vocab-parallel LM heads today.
+
+First, correctness. A fast wrong loss is worthless, so we check the sharded loss against plain single-GPU cross-entropy — forward **and** gradient — then do the traffic accounting honestly.
+#%%py
+from seq2seq.data import PAD
+torch.manual_seed(0)
+T_, B_, V_ = 7, 5, 40
+devs = [torch.device("cuda:0"), torch.device("cuda:1")]
+
+# One reference logits tensor, in float64 so the comparison is unambiguous.
+ref_logits = torch.randn(T_, B_, V_, dtype=torch.float64, device=devs[0], requires_grad=True)
+targets = torch.randint(0, V_, (T_, B_), device=devs[0])
+targets[0, 0] = PAD            # make sure padding is exercised
+targets[3, 2] = PAD
+
+# Reference: ordinary cross entropy on one device.
+ref_loss = sequence_loss(ref_logits, targets)
+ref_loss.backward()
+ref_grad = ref_logits.grad.clone()
+
+# Sharded: cut the vocabulary in half, put each half on its own GPU.
+half = V_ // 2
+offsets = [0, half]
+shards = [ref_logits.detach()[..., :half].to(devs[0]).requires_grad_(),
+          ref_logits.detach()[..., half:].to(devs[1]).requires_grad_()]
+shard_loss = vocab_parallel_cross_entropy(shards, targets, offsets, devs[0])
+shard_loss.backward()
+shard_grad = torch.cat([shards[0].grad.to(devs[0]), shards[1].grad.to(devs[0])], dim=-1)
+
+print(f"reference loss (1 GPU, full vocab)  : {ref_loss.item():.12f}")
+print(f"vocab-parallel loss (2 GPUs, halves): {shard_loss.item():.12f}")
+print(f"  |difference|                      : {abs(ref_loss.item()-shard_loss.item()):.3e}")
+print(f"  max |grad difference|             : {(ref_grad-shard_grad).abs().max().item():.3e}")
+assert abs(ref_loss.item() - shard_loss.item()) < 1e-12
+assert (ref_grad - shard_grad).abs().max().item() < 1e-12
+print("\nExact: same loss, same gradients. Now — what did the sharding actually cost?")
+
+# --- traffic accounting at the paper's dimensions -------------------------
+# Careful here: it is easy to overstate the win. Break the transfers into the
+# part that BOTH schemes must pay and the part that differs.
+Tp, Bp, Vp, Hp, K = 30, 128, 80_000, 1000, 4      # K = number of shards
+f32 = 4
+common_out = Tp * Bp * Hp * f32 * K       # hidden states -> every shard (both schemes)
+naive_back = Tp * Bp * Vp * f32           # each shard returns its OWN slice; slices sum to V
+smart_back = Tp * Bp * f32 * 2 * K        # max and sum-exp, two (T,B) scalars per shard
+
+print(f"\npaper dims (T=30, B=128, V=80,000, H=1000, {K} shards), bytes per forward:")
+print(f"   hidden states out to shards (both schemes) : {common_out/1e6:9.1f} MB")
+print(f"   RETURN traffic, gather-the-logits          : {naive_back/1e6:9.1f} MB")
+print(f"   RETURN traffic, move-the-reduction         : {smart_back/1e6:9.4f} MB"
+      f"   ({naive_back/smart_back:,.0f}x less)")
+print(f"   ---")
+print(f"   end-to-end, gather-the-logits              : {(common_out+naive_back)/1e6:9.1f} MB")
+print(f"   end-to-end, move-the-reduction             : {(common_out+smart_back)/1e6:9.1f} MB"
+      f"   ({(common_out+naive_back)/(common_out+smart_back):.1f}x less)")
+print(f"\n   At ~12 GB/s over PCIe 3.0 x16 that is "
+      f"{(common_out+naive_back)/12e9*1e3:.0f} ms vs "
+      f"{(common_out+smart_back)/12e9*1e3:.0f} ms per step, per direction.")
+save_result({"loss_diff": abs(ref_loss.item()-shard_loss.item()),
+             "grad_diff": (ref_grad-shard_grad).abs().max().item(),
+             "common_out_bytes": common_out, "naive_back_bytes": naive_back,
+             "smart_back_bytes": smart_back}, "ch4_sharded_softmax.json");
+#%%md
+### Exact loss, exact gradients, and an honest accounting of the win
+
+```
+reference loss (1 GPU, full vocab)  : 4.112264874120
+vocab-parallel loss (2 GPUs, halves): 4.112264874120
+  |difference|                      : 8.882e-16      <- float64 machine epsilon
+  max |grad difference|             : 6.072e-18
+```
+
+Not "close enough" — the same number. The sharded softmax is not an approximation, it's an algebraic rearrangement.
+
+Now the traffic, and note that this is where it's easy to lie to yourself:
+
+```
+   hidden states out to shards (both schemes) :      61.4 MB
+   RETURN traffic, gather-the-logits          :    1228.8 MB
+   RETURN traffic, move-the-reduction         :    0.1229 MB   (10,000x less)
+   ---
+   end-to-end, gather-the-logits              :    1290.2 MB
+   end-to-end, move-the-reduction             :      61.6 MB   (21.0x less)
+
+   At ~12 GB/s over PCIe 3.0 x16: 108 ms vs 5 ms per step, per direction.
+```
+
+The headline "10,000×" is real but applies only to the **return** leg. Both schemes still have to ship the hidden states *out* to every shard, and that 61 MB is irreducible. So the honest end-to-end number is **21×**, and 108 ms → 5 ms per step per direction.
+
+That's still the difference between a working design and a broken one: at 108 ms of transfer against ~1000 ms of compute you have burned 10% of your step on the bus for nothing. But quote the 21×, not the 10,000×. **When you report a speedup, always include the part that didn't speed up** — otherwise the first person to measure end-to-end will not believe anything else you told them.
+
+## 4.4 Now measure it: five ways to run one training step
+
+We take the paper's exact 384M-parameter model and run a real training step (forward, backward, clip, SGD update) under five regimes:
+
+1. **1 GPU** — the baseline.
+2. **2 GPUs, model-parallel, no pipelining** — layers 0-1 on `cuda:0`, layers 2-3 on `cuda:1`, vocabulary split in half. One batch at a time, so we should see the 50% bubble.
+3. **2 GPUs, model-parallel, pipelined** — the same, with the batch split into $M$ micro-batches. Predicted utilisation $\frac{M}{M+1}$.
+4. **2 GPUs, `nn.DataParallel`** — a full copy on each card, batch split down the middle.
+5. **2 GPUs, real `DistributedDataParallel`** — one process per GPU, NCCL all-reduce.
+
+Predict before you look. Which wins, and why?
+#%%py
+CFG = paper_config()
+B, S, T = 128, 30, 30
+WORDS = B * (S + T)          # paper counts English + French words
+
+def make_batch(dev="cpu"):
+    g = torch.Generator().manual_seed(0)
+    return (torch.randint(4, CFG["src_vocab"], (S, B), generator=g).to(dev),
+            torch.randint(4, CFG["tgt_vocab"], (T, B), generator=g).to(dev),
+            torch.randint(4, CFG["tgt_vocab"], (T, B), generator=g).to(dev))
+
+results = {}
+
+# ---------- 1. single GPU ----------
+free()
+m1 = Seq2Seq(**CFG).to("cuda:0")
+o1 = torch.optim.SGD(m1.parameters(), lr=0.7)
+s1, ti1, to1 = make_batch("cuda:0")
+def step1():
+    o1.zero_grad(set_to_none=True)
+    sequence_loss(m1(s1, ti1), to1).backward()
+    torch.nn.utils.clip_grad_norm_(m1.parameters(), 5.0); o1.step()
+sec = timed_steps(step1, 2, 5)
+results["1 GPU"] = {"sec": sec, "wps": int(WORDS/sec),
+                    "mem_gpu0": round(gpu_mem(0)["peak_GB"], 2),
+                    "mem_gpu1": round(gpu_mem(1)["peak_GB"], 2)}
+del m1, o1, s1, ti1, to1; free()
+
+# ---------- 2 & 3. model parallel, chunks = 1 (no pipeline), 2, 4, 8 ----------
+mp = ModelParallelSeq2Seq(**CFG, devices=devs)
+omp = torch.optim.SGD(mp.parameters(), lr=0.7)
+smp, timp, tomp = make_batch("cuda:0")
+
+print("parameter placement (model-parallel):")
+for d, info in sorted(mp.param_placement().items()):
+    print(f"   {d}: {info['params']/1e6:7.1f}M params  {info['bytes']/1e9:5.2f} GB")
+
+for chunks in [1, 2, 4, 8]:
+    free()
+    def step_mp():
+        omp.zero_grad(set_to_none=True)
+        loss = mp.loss_pipelined(smp, timp, tomp, chunks=chunks)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(mp.parameters(), 5.0); omp.step()
+    sec = timed_steps(step_mp, 2, 5)
+    label = "2 GPU model-par" + (" (no pipeline)" if chunks == 1 else f" (pipeline x{chunks})")
+    results[label] = {"sec": sec, "wps": int(WORDS/sec),
+                      "mem_gpu0": round(gpu_mem(0)["peak_GB"], 2),
+                      "mem_gpu1": round(gpu_mem(1)["peak_GB"], 2)}
+    print(f"   chunks={chunks}: {sec*1000:7.1f} ms/step  {int(WORDS/sec):>6,} words/s")
+del mp, omp, smp, timp, tomp; free()
+#%%py
+# ---------- 4. nn.DataParallel (a full copy of the model on each GPU) ----------
+# It scatters along dim 0 by default; our tensors are TIME-first, so we must
+# pass dim=1 or it would split the SEQUENCE across GPUs instead of the batch —
+# a bug that produces plausible-looking garbage rather than a crash.
+free()
+mdp = Seq2Seq(**CFG).to("cuda:0")
+dp = torch.nn.DataParallel(mdp, device_ids=[0, 1], dim=1)
+odp = torch.optim.SGD(mdp.parameters(), lr=0.7)
+sdp, tidp, todp = make_batch("cuda:0")
+def step_dp():
+    odp.zero_grad(set_to_none=True)
+    sequence_loss(dp(sdp, tidp), todp).backward()
+    torch.nn.utils.clip_grad_norm_(mdp.parameters(), 5.0); odp.step()
+sec = timed_steps(step_dp, 2, 5)
+results["2 GPU data-par (DataParallel)"] = {
+    "sec": sec, "wps": int(WORDS/sec),
+    "mem_gpu0": round(gpu_mem(0)["peak_GB"], 2),
+    "mem_gpu1": round(gpu_mem(1)["peak_GB"], 2)}
+del mdp, dp, odp, sdp, tidp, todp; free()
+
+# ---------- 5. REAL data parallelism: DistributedDataParallel via torchrun ----
+# DataParallel is single-process/multi-thread and re-replicates the whole model
+# to GPU1 on EVERY forward. DDP is one process per GPU with the model resident,
+# all-reducing gradients inside backward(). We cannot launch processes from a
+# live kernel, so we shell out. A hard timeout guards against a hung NCCL
+# rendezvous (this backend has no kernel-interrupt button).
+sync_repo(); free()
+cmd = [sys.executable, "-m", "torch.distributed.run", "--nproc_per_node=2",
+       "--master_port=29517", f"{REPO_DIR}/scripts/ddp_bench.py"]
+print("$", " ".join(cmd[1:]), "\n")
+try:
+    p = subprocess.run(cmd, capture_output=True, text=True, timeout=600, cwd=REPO_DIR)
+    line = [l for l in (p.stdout + p.stderr).splitlines() if l.startswith("DDP_RESULT")]
+    if line:
+        kv = dict(x.split("=") for x in line[0].split()[1:])
+        sec = float(kv["sec_per_step"])
+        results["2 GPU data-par (real DDP)"] = {
+            "sec": sec, "wps": int(kv["words_per_sec"]),
+            "mem_gpu0": float(kv["peak_GB"]), "mem_gpu1": float(kv["peak_GB"])}
+        print("DDP:", kv)
+    else:
+        print("no DDP_RESULT line; last stderr:\n", p.stderr[-1500:])
+except subprocess.TimeoutExpired:
+    print("DDP benchmark timed out after 600s")
+
+# ---------- summary ----------
+base = results["1 GPU"]["sec"]
+print(f"\nPAPER MODEL (384M params), batch 128, 30+30 tokens, 2x Tesla T4")
+print(f"{'regime':<34} | {'ms/step':>8} | {'words/s':>9} | {'vs 1 GPU':>8} | "
+      f"{'GPU0 GB':>7} | {'GPU1 GB':>7}")
+print("-" * 92)
+for k, v in results.items():
+    print(f"{k:<34} | {v['sec']*1000:8.1f} | {v['wps']:9,} | {base/v['sec']:7.2f}x | "
+          f"{v['mem_gpu0']:7.2f} | {v['mem_gpu1']:7.2f}")
+print(f"\n{'paper, 1 GPU (2014 K40, C++)':<34} | {'':>8} | {1700:9,} |    1.00x")
+print(f"{'paper, 8 GPUs':<34} | {'':>8} | {6300:9,} | {6300/1700:7.2f}x")
+
+fig, ax = plt.subplots(figsize=(7.6, 3.4))
+names = list(results); vals = [results[k]["wps"] for k in names]
+def colour(n):
+    if n.startswith("1 GPU"): return "#7f8c8d"
+    if "model-par" in n:      return "#2471a3"
+    return "#27ae60"
+ax.barh(range(len(names)), vals, color=[colour(n) for n in names])
+ax.set_yticks(range(len(names))); ax.set_yticklabels(names, fontsize=7.5)
+ax.invert_yaxis(); ax.set_xlabel("words / second (higher is better)")
+ax.axvline(results["1 GPU"]["wps"], ls="--", c="k", lw=1)
+for i, v in enumerate(vals):
+    ax.text(v*1.01, i, f"{v:,}  ({v/vals[0]:.2f}x)", va="center", fontsize=7)
+ax.set_title("Paper's 384M model on 2x T4: what each parallelism actually buys")
+ax.set_xlim(0, max(vals)*1.30); ax.grid(alpha=0.25, axis="x")
+savefig(fig, "fig03_parallelism.png")
+save_result(results, "ch4_parallel_bench.json");
+#%%md
+### The full picture — and it does not match the folklore
+
+```
+regime                             |  ms/step |   words/s | vs 1 GPU | GPU0 GB | GPU1 GB
+----------------------------------------------------------------------------------------
+1 GPU                              |   1141.4 |     6,728 |    1.00x |    6.02 |    0.00
+2 GPU model-par (no pipeline)      |    727.1 |    10,563 |    1.57x |    3.53 |    2.56
+2 GPU model-par (pipeline x2)      |    647.9 |    11,852 |    1.76x |    3.34 |    2.25   <- best
+2 GPU model-par (pipeline x4)      |    773.5 |     9,928 |    1.48x |    3.80 |    2.09
+2 GPU model-par (pipeline x8)      |    983.9 |     7,805 |    1.16x |    4.14 |    2.15
+2 GPU data-par (DataParallel)      |   1144.1 |     6,712 |    1.00x |    5.90 |    2.57   <- zero gain
+2 GPU data-par (real DDP)          |    875.4 |     8,773 |    1.30x |    5.33 |    5.33
+
+paper, 8 GPUs                                     6,300      3.71x
+```
+
+Five things worth learning here, in order of how much they'll save you later.
+
+---
+
+**1. `nn.DataParallel` bought exactly nothing. 1.00×.**
+
+This is not a fluke, it's structural. `DataParallel` is one process driving two GPUs with threads, and on *every single forward pass* it:
+
+1. **re-replicates the entire model** from GPU0 to GPU1 — that's 1.54 GB over PCIe, per step;
+2. scatters the batch;
+3. runs both replicas in Python threads, fighting the GIL;
+4. gathers all outputs back to GPU0;
+5. runs backward on GPU0 only, then throws the replica away.
+
+Step 1 alone costs about as much as the compute it was supposed to accelerate. `nn.DataParallel` is deprecated for exactly this reason, and it is still the first thing every tutorial reaches for. **If you take one practical thing from this chapter: never use `nn.DataParallel`.**
+
+**2. Real DDP gave 1.30×, not 2×** — and that's the honest ceiling for this model. DDP holds a resident model per process and all-reduces gradients *inside* `backward()`, bucketed so most of the communication overlaps compute that was happening anyway. But it still moves 1.54 GB of gradients per step across PCIe with no NVLink. Data parallelism wins when the model is *small* relative to compute per example. A 384M-parameter model doing only 30 timesteps of work is close to the worst case for it.
+
+**3. Model parallelism won — 1.76× — which is the opposite of the usual advice.**
+
+The usual advice ("use data parallelism unless the model doesn't fit") is right *most* of the time, and wrong here, for two specific reasons:
+
+- **It splits the softmax.** 87% of activation memory and the single most expensive op is the $1000 \times 80{,}000$ generator. Each GPU computes half the vocabulary — a genuine halving of the dominant cost, not just a redistribution.
+- **It ships activations, not parameters.** Model-parallel traffic is $O(B \times T \times H)$ = 61 MB. DDP traffic is $O(\text{params})$ = 1,540 MB. **25× less data on the wire.**
+
+The lesson isn't "model parallelism is better." It's: **compare $O(\text{params})$ against $O(B{\times}T{\times}H)$ for your actual model, and let that pick the strategy.**
+
+**4. Pipelining helped at ×2 and then made things worse.**
+
+The GPipe formula $\frac{M}{M+S-1}$ predicts utilisation should climb monotonically: 50% → 67% → 80% → 89%. Measured, it peaks at $M{=}2$ and falls off a cliff.
+
+The formula counts only the bubble. It ignores that **micro-batches get smaller**. At $M{=}8$ each micro-batch is 16 sequences, and a cuDNN LSTM kernel at batch 16 cannot saturate 40 SMs — you pay full kernel-launch latency for a fraction of the work. Add 8× as many PCIe transfers and the efficiency loss overtakes the bubble gain.
+
+> **Every parallelism formula you'll read is an upper bound that assumes the per-device work stays efficient.** Find the crossover empirically.
+
+**5. The GPUs are not evenly loaded — 312M vs 72M parameters.**
+
+All 240M parameters of embeddings sit on `cuda:0`, because that's where the input tokens land. Our split is balanced by *layer*, not by *bytes* or by *FLOPs*. A production layout would move the target embedding to `cuda:1` or shard the embedding tables. **Balancing a model-parallel split is its own optimisation problem, and "one layer per GPU" is the naive answer** — which, note, is precisely what the paper did.
+
+---
+
+### Two honest caveats about this comparison
+
+- **Our pipelining is not the paper's pipelining.** We split the *batch* into micro-batches (GPipe-style). The paper pipelines at *timestep* granularity, within one batch. That is finer-grained and would suffer less from the small-micro-batch problem in point 4, but it needs custom CUDA-stream work that `nn.LSTM`'s fused kernel doesn't expose. Our 1.76× is a floor for what their scheme achieves, not a ceiling.
+- **Our best 2-GPU number, 11,852 words/sec, is 1.9× the paper's entire 8-GPU result of 6,300.** Twelve years of hardware and kernels.
+
+📊 `artifacts/fig03_parallelism.png`
