@@ -75,6 +75,15 @@ class TrainConfig:
     epochs: float = 7.5             # §3.4
     constant_epochs: float = 5.0    # §3.4: halving begins after 5
     halve_every: float = 0.5        # §3.4: "every half epoch"
+    # How the loss is normalised BEFORE .backward(). This one line decides
+    # whether the paper's lr=0.7 and clip=5 mean anything at all.
+    #   "sentence" — sum over all tokens, divided by the number of SENTENCES.
+    #                This is the paper: "we used batches of 128 sequences for
+    #                the gradient and divided it by the size of the batch
+    #                (namely, 128)". Gradient norms come out ~20x larger.
+    #   "token"    — the modern default: divide by the number of TOKENS.
+    # We report per-token loss either way, so perplexity stays comparable.
+    grad_normalization: str = "sentence"
     # --- our adaptations, all declared ---
     reverse_source: bool = True     # §3.3, the thing Chapter 3 A/B-tests
     bucket_multiplier: int = 50
@@ -137,7 +146,8 @@ def train(model: Seq2Seq, corpus, cfg: TrainConfig, verbose: bool = True) -> Dic
     opt = torch.optim.SGD(model.parameters(), lr=cfg.lr, momentum=cfg.momentum)
 
     hist = {"epoch": [], "train_loss": [], "valid_loss": [], "valid_ppl": [],
-            "lr": [], "clip_frac": [], "sec": [], "words_per_sec": []}
+            "lr": [], "clip_frac": [], "sec": [], "words_per_sec": [],
+            "grad_norm_median": []}
     n_batches = len(D.bucket_batches(train_ex, cfg.batch_size,
                                      bucket_multiplier=cfg.bucket_multiplier))
     total_epochs = cfg.epochs
@@ -148,6 +158,7 @@ def train(model: Seq2Seq, corpus, cfg: TrainConfig, verbose: bool = True) -> Dic
         ep_int = int(ep)
         t0 = time.time()
         run_loss, run_tok, clipped, seen, words = 0.0, 0, 0, 0, 0
+        grad_norms: List[float] = []
         # A different seed per epoch, so the pooled bucketing reshuffles.
         for src, tin, tout in D.iterate(train_ex, cfg.batch_size, cfg.device,
                                         shuffle=True, seed=cfg.seed * 1000 + ep_int,
@@ -159,17 +170,28 @@ def train(model: Seq2Seq, corpus, cfg: TrainConfig, verbose: bool = True) -> Dic
                 g["lr"] = cur_lr
 
             opt.zero_grad(set_to_none=True)
+            # `loss` is always per-token, so exp(loss) is perplexity and the
+            # numbers we print are comparable to §3.3 regardless of the
+            # normalisation we backprop through.
             loss = sequence_loss(model(src, tin), tout, cfg.label_smoothing)
-            loss.backward()
+            ntok_t = (tout != D.PAD).sum()
+            if cfg.grad_normalization == "sentence":
+                # Recover the SUM over tokens, then divide by the batch's
+                # sentence count — exactly the paper's "divided it by 128".
+                loss_for_grad = loss * ntok_t / src.size(1)
+            else:
+                loss_for_grad = loss
+            loss_for_grad.backward()
 
             # §3.4's hard constraint. clip_grad_norm_ returns the norm BEFORE
             # clipping, which is exactly the `s` in the paper's formula, so we
             # can count how often the constraint actually binds.
             s = torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.clip)
+            grad_norms.append(s.item())
             clipped += int(s.item() > cfg.clip)
             opt.step()
 
-            ntok = (tout != D.PAD).sum().item()
+            ntok = ntok_t.item()
             run_loss += loss.item() * ntok
             run_tok += ntok
             words += src.numel() + tout.numel()
@@ -188,10 +210,13 @@ def train(model: Seq2Seq, corpus, cfg: TrainConfig, verbose: bool = True) -> Dic
         hist["clip_frac"].append(clipped / max(seen, 1))
         hist["sec"].append(dt)
         hist["words_per_sec"].append(int(words / dt))
+        grad_norms.sort()
+        hist["grad_norm_median"].append(grad_norms[len(grad_norms) // 2])
         if verbose:
             print(f"  epoch {ep_int+1:>2}/{int(total_epochs)}  "
                   f"train {run_loss/run_tok:.3f}  valid {va['loss']:.3f}  "
                   f"ppl {va['ppl']:6.2f}  lr {cur_lr:.4f}  "
+                  f"|g| {hist['grad_norm_median'][-1]:6.2f}  "
                   f"clip {100*clipped/max(seen,1):4.1f}%  "
                   f"{int(words/dt):,} w/s  {dt:.1f}s")
         ep += 1.0
