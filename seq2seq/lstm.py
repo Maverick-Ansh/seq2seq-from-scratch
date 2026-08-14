@@ -344,31 +344,48 @@ class VanillaRNNLayer(nn.Module):
         return torch.stack(outs), h
 
 
-def grad_flow_demo(T: int = 100, B: int = 4, H: int = 64, device: str = "cpu") -> dict:
+def grad_flow_demo(T: int = 100, B: int = 4, H: int = 64, device: str = "cpu",
+                   forget_biases: Optional[List[float]] = None) -> dict:
     """Measure how much gradient survives the trip from step T back to step t.
 
-    METHOD. Feed a length-T sequence of inputs, each of which requires grad.
-    Take the loss at the LAST timestep only. Then ||d loss / d x_t|| tells you
-    how much influence the input at time t still has on the final output — i.e.
-    how far back the model can actually learn. We report the norm at each t,
-    normalised so the last step is 1.0.
+    METHOD. Feed a length-T sequence of inputs that require grad. Put a loss on
+    the LAST timestep only. Then ||d loss / d x_t|| says how much influence the
+    input at time t still has on the final output — i.e. how far back the model
+    could possibly learn. We normalise so the last step reads 1.0.
 
-    WHAT YOU WILL SEE. For the vanilla RNN the curve falls off a cliff — by 30
-    steps back the gradient is typically 1e-4 of its final value, by 60 steps
-    it is numerically zero. For the LSTM it decays gently, staying within a
-    couple of orders of magnitude across 100 steps.
+    WHAT YOU WILL ACTUALLY SEE (and the honest version of the textbook story).
+    At *initialisation* both curves decay. The LSTM decays more slowly — about
+    three orders of magnitude better by 30 steps — but it does decay, and a
+    beginner who was promised "LSTMs solve vanishing gradients" is entitled to
+    ask why.
+
+    The answer is that a freshly initialised LSTM has all its pre-activations
+    near zero, so the forget gate sits at f = sigmoid(0) = 0.5. The memory line
+    therefore multiplies by 0.5 every step: 0.5^30 ~ 1e-9. The decay is not a
+    property of the architecture, it is a property of *this particular point*
+    in its parameter space.
+
+    The architecture's real gift is that a NON-decaying point EXISTS and is
+    reachable. Push the forget-gate bias up and f moves toward 1: at bias 3,
+    f = sigmoid(3) = 0.95 and 0.95^30 = 0.21 — the gradient arrives basically
+    intact. Gradient descent can find that region, because f is produced by
+    learnable parameters. A vanilla RNN has no such region: making the
+    recurrence non-decaying means pushing W's spectral radius to 1, which makes
+    the forward pass blow up in every direction it is not needed.
+
+    So we sweep the forget-gate bias, and let the reader watch a knob turn the
+    vanishing gradient off.
 
     THIS IS THE WHOLE PAPER IN ONE PLOT. Sutskever et al. need the encoder's
     first word to still influence the decoder's first word, which for a 25-word
     sentence is a 25+ step gap. Reversing the source (§3.3) shrinks that gap for
-    the *early* words to ~0, which is exactly why it helps so much: it moves
-    the hardest dependencies into the part of the curve that has not decayed.
+    the *early* words to ~0, which is exactly why it helps so much: it moves the
+    hardest dependencies into the part of the curve that has not decayed yet.
     """
+    if forget_biases is None:
+        forget_biases = [0.0, 1.0, 3.0]
     torch.manual_seed(0)
     x = torch.randn(T, B, H, device=device)
-
-    rnn = VanillaRNNLayer(H, H).to(device)
-    lstm = LSTMLayerScratch(H, H).to(device)
 
     def run(model) -> List[float]:
         inp = x.clone().requires_grad_()
@@ -379,4 +396,9 @@ def grad_flow_demo(T: int = 100, B: int = 4, H: int = 64, device: str = "cpu") -
         last = per_t[-1] if per_t[-1] > 0 else 1.0
         return [v / last for v in per_t]
 
-    return {"rnn": run(rnn), "lstm": run(lstm), "T": T}
+    torch.manual_seed(0)
+    out = {"T": T, "rnn": run(VanillaRNNLayer(H, H).to(device)), "lstm": {}}
+    for fb in forget_biases:
+        torch.manual_seed(0)   # identical weights; ONLY the forget bias differs
+        out["lstm"][str(fb)] = run(LSTMLayerScratch(H, H, forget_bias=fb).to(device))
+    return out
